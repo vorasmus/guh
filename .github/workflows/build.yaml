@@ -77,6 +77,8 @@ jobs:
           from pathlib import Path
 
           ENC = "latin-1"
+          FLASH_MAX = 32768
+          EEPROM_MAX = 1024
 
           # Locate extracted source directory
           src_dir = None
@@ -86,9 +88,6 @@ jobs:
           if not src_dir:
               sys.exit("ERROR: Could not locate config_328.h in extracted archive.")
           print(f"Source directory: {src_dir}")
-
-          FLASH_MAX = 32768
-          EEPROM_MAX = 1024
 
           def has_macro(text, name):
               return re.search(rf"(?m)^\s*(?://\s*)?#define\s+{re.escape(name)}\b", text) is not None
@@ -107,11 +106,13 @@ jobs:
                   text,
               )
 
-          def set_macro_val(text, name, val):
+          def set_macro_first(text, name, val):
+              text = disable_macro(text, name)
               return re.sub(
-                  rf"(?m)^(\s*)(?://\s*)?(#define\s+{re.escape(name)})(?:\s+(?!/\*)\S+)?",
+                  rf"(?m)^(\s*)//\s*(#define\s+{re.escape(name)})(?:\s+(?!/\*)\S+)?",
                   rf"\1\2 {val}",
                   text,
+                  count=1,
               )
 
           def build_and_measure():
@@ -128,7 +129,7 @@ jobs:
                   text=True,
               )
               if res.returncode != 0:
-                  return False, 0, 0, 0, res.stderr
+                  return False, 0, 0, 0, (res.stdout + "\n" + res.stderr)
               out = subprocess.check_output(
                   ["avr-size", "-A", "ComponentTester.elf"],
                   cwd=src_dir,
@@ -155,42 +156,43 @@ jobs:
           mk = re.sub(r"(?m)^FREQ\s*=.*", "FREQ = 8", mk)
           mk_path.write_text(mk, encoding=ENC)
 
-          # 2. Patch config_328.h (Disable HD44780, Enable AY-AT ST7735, Set Encoder pins)
+          # 2. Patch config_328.h — disable EVERY display block first, then enable only ST7735
           c328_path = src_dir / "config_328.h"
           lines = c328_path.read_text(encoding=ENC).splitlines(keepends=True)
 
-          # Disable default HD44780 block
-          for i, ln in enumerate(lines):
-              if re.match(r"^\s*#define\s+LCD_HD44780\b", ln):
-                  for j in range(i - 1, max(-1, i - 10), -1):
-                      if re.match(r"^\s*(?://\s*)?#if\s+[01]\b", lines[j]):
-                          lines[j] = "#if 0\n"
-                          break
-                  for j in range(i + 1, len(lines)):
-                      if re.match(r"^\s*(?://\s*)?#endif\b", lines[j]):
-                          lines[j] = "#endif\n"
-                          break
-                  break
+          stack = []
+          display_blocks = []
+          for idx, ln in enumerate(lines):
+              if re.match(r"^\s*#\s*(?:if|ifdef|ifndef)\b", ln):
+                  stack.append((idx, ln))
+              elif re.match(r"^\s*#\s*endif\b", ln) and stack:
+                  s_idx, s_ln = stack.pop()
+                  if re.match(r"^\s*#\s*if\s+[01]\b", s_ln):
+                      body_text = "".join(lines[s_idx + 1 : idx])
+                      if re.search(
+                          r"(?m)^\s*(?://\s*)?#define\s+(?:LCD_GRAPHIC|LCD_TEXT|LCD_DOTS_X|LCD_CHAR_X)\b",
+                          body_text,
+                      ):
+                          display_blocks.append((s_idx, idx))
 
-          # Locate and configure ST7735 block
-          st_start = st_end = None
-          for i, ln in enumerate(lines):
-              if re.match(r"^\s*(?://\s*)?#define\s+LCD_ST7735\b", ln):
-                  for j in range(i - 1, max(-1, i - 10), -1):
-                      if re.match(r"^\s*(?://\s*)?#if\s+[01]\b", lines[j]):
-                          st_start = j
-                          break
-                  for j in range(i + 1, len(lines)):
-                      if re.match(r"^\s*(?://\s*)?#endif\b", lines[j]):
-                          st_end = j
-                          break
-                  break
+          for s_idx, _ in display_blocks:
+              lines[s_idx] = "#if 0\n"
 
-          if st_start is None or st_end is None:
+          st_matches = [
+              (s, e)
+              for (s, e) in display_blocks
+              if re.search(
+                  r"(?m)^\s*(?://\s*)?#define\s+LCD_ST7735\b",
+                  "".join(lines[s + 1 : e]),
+              )
+          ]
+          if not st_matches:
               sys.exit("ERROR: Could not locate ST7735 block in config_328.h")
 
+          st_start, st_end = min(st_matches, key=lambda pair: pair[1] - pair[0])
+          print(f"Disabled {len(display_blocks)} display block(s); enabling ST7735 (lines {st_start + 1}-{st_end + 1})")
+
           lines[st_start] = "#if 1\n"
-          lines[st_end] = "#endif\n"
           block = "".join(lines[st_start + 1 : st_end])
 
           # Driver choice
@@ -203,6 +205,7 @@ jobs:
                       r"(?m)^(\s*)(?://\s*)?#define\s+LCD_ST7735\b",
                       r"\1#define LCD_SEMI_ST7735",
                       block,
+                      count=1,
                   )
           else:
               block = enable_macro(block, "LCD_ST7735")
@@ -220,7 +223,7 @@ jobs:
               ("LCD_DOTS_X", "128"),
               ("LCD_DOTS_Y", "160"),
           ]:
-              block = set_macro_val(block, macro, val)
+              block = set_macro_first(block, macro, val)
 
           block = enable_macro(block, "LCD_ROTATE")
           block = enable_macro(block, "LCD_LATE_ON")
@@ -236,7 +239,7 @@ jobs:
 
           for off_macro, env_key in [("LCD_OFFSET_X", "LCD_OFFSET_X"), ("LCD_OFFSET_Y", "LCD_OFFSET_Y")]:
               val = int(os.environ[env_key] or "0")
-              block = set_macro_val(block, off_macro, str(val)) if val > 0 else disable_macro(block, off_macro)
+              block = set_macro_first(block, off_macro, str(val)) if val > 0 else disable_macro(block, off_macro)
 
           # Select font & symbol set
           block = re.sub(r"(?m)^(\s*)(#define\s+FONT_\w+)", r"\1//\2", block)
@@ -245,8 +248,8 @@ jobs:
           block = enable_macro(block, os.environ["SYMBOLS"])
 
           c328_text = "".join(lines[: st_start + 1]) + block + "".join(lines[st_end:])
-          c328_text = set_macro_val(c328_text, "ENCODER_A", "PD1")
-          c328_text = set_macro_val(c328_text, "ENCODER_B", "PD3")
+          c328_text = set_macro_first(c328_text, "ENCODER_A", "PD1")
+          c328_text = set_macro_first(c328_text, "ENCODER_B", "PD3")
           c328_path.write_text(c328_text, encoding=ENC)
 
           # 3. Patch config.h — AY-AT hardware baseline
@@ -269,8 +272,8 @@ jobs:
           for m in base_enable:
               cfg = enable_macro(cfg, m)
 
-          cfg = set_macro_val(cfg, "ENCODER_PULSES", "4")
-          cfg = set_macro_val(cfg, "ENCODER_STEPS", "20")
+          cfg = set_macro_first(cfg, "ENCODER_PULSES", "4")
+          cfg = set_macro_first(cfg, "ENCODER_STEPS", "20")
 
           if os.environ["HW_REF25"] == "true":
               cfg = enable_macro(cfg, "HW_REF25")
@@ -328,10 +331,10 @@ jobs:
                   good_cfg = trial
                   flash, ram, eeprom = f_new, r_new, e_new
                   added.append((feat, f_new))
-                  print(f"  + {feat} fits (flash={f_new}/{FLASH_MAX}, eeprom={e_new}/{EEPROM_MAX})")
+                  print(f" + {feat} fits (flash={f_new}/{FLASH_MAX}, eeprom={e_new}/{EEPROM_MAX})")
               else:
                   skipped.append((feat, "exceeds 32KB flash or incompatible"))
-                  print(f"  - {feat} skipped (overflow/incompatible)")
+                  print(f" - {feat} skipped (overflow/incompatible)")
                   if feat == "SW_PWM_PLUS" and has_macro(good_cfg, "SW_PWM_SIMPLE"):
                       trial_fb = enable_macro(good_cfg, "SW_PWM_SIMPLE")
                       cfg_path.write_text(trial_fb, encoding=ENC)
@@ -340,7 +343,7 @@ jobs:
                           good_cfg = trial_fb
                           flash, ram, eeprom = f_fb, r_fb, e_fb
                           added.append(("SW_PWM_SIMPLE (fallback)", f_fb))
-                          print(f"  + SW_PWM_SIMPLE fallback fits (flash={f_fb}/{FLASH_MAX})")
+                          print(f" + SW_PWM_SIMPLE fallback fits (flash={f_fb}/{FLASH_MAX})")
 
           # Final clean build with winning config
           cfg_path.write_text(good_cfg, encoding=ENC)

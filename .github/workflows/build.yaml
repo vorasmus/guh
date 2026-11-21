@@ -156,27 +156,37 @@ jobs:
           mk = re.sub(r"(?m)^FREQ\s*=.*", "FREQ = 8", mk)
           mk_path.write_text(mk, encoding=ENC)
 
-          # 2. Patch config_328.h — disable EVERY display block first, then enable only ST7735
+          # 2. Patch config_328.h — disable EVERY display block (including //#if 0 ... //#endif), then enable only ST7735
           c328_path = src_dir / "config_328.h"
           lines = c328_path.read_text(encoding=ENC).splitlines(keepends=True)
 
           stack = []
           display_blocks = []
+          disp_re = re.compile(
+              r"(?m)^\s*(?://\s*)?#define\s+(?:LCD_GRAPHIC|LCD_TEXT|LCD_DOTS_X|LCD_CHAR_X)\b"
+          )
+
           for idx, ln in enumerate(lines):
-              if re.match(r"^\s*#\s*(?:if|ifdef|ifndef)\b", ln):
-                  stack.append((idx, ln))
-              elif re.match(r"^\s*#\s*endif\b", ln) and stack:
-                  s_idx, s_ln = stack.pop()
-                  if re.match(r"^\s*#\s*if\s+[01]\b", s_ln):
-                      body_text = "".join(lines[s_idx + 1 : idx])
-                      if re.search(
-                          r"(?m)^\s*(?://\s*)?#define\s+(?:LCD_GRAPHIC|LCD_TEXT|LCD_DOTS_X|LCD_CHAR_X)\b",
-                          body_text,
-                      ):
+              if re.match(r"^\s*//\s*#\s*if\s+[01]\b", ln):
+                  stack.append(("toggle_commented", idx))
+              elif re.match(r"^\s*//\s*#\s*endif\b", ln):
+                  if stack and stack[-1][0] == "toggle_commented":
+                      _, s_idx = stack.pop()
+                      if disp_re.search("".join(lines[s_idx + 1 : idx])):
+                          display_blocks.append((s_idx, idx))
+              elif re.match(r"^\s*#\s*if\s+[01]\b", ln):
+                  stack.append(("toggle", idx))
+              elif re.match(r"^\s*#\s*(?:if|ifdef|ifndef)\b", ln):
+                  stack.append(("normal", idx))
+              elif re.match(r"^\s*#\s*endif\b", ln):
+                  if stack:
+                      kind, s_idx = stack.pop()
+                      if kind == "toggle" and disp_re.search("".join(lines[s_idx + 1 : idx])):
                           display_blocks.append((s_idx, idx))
 
-          for s_idx, _ in display_blocks:
+          for s_idx, e_idx in display_blocks:
               lines[s_idx] = "#if 0\n"
+              lines[e_idx] = "#endif\n"
 
           st_matches = [
               (s, e)
@@ -193,6 +203,7 @@ jobs:
           print(f"Disabled {len(display_blocks)} display block(s); enabling ST7735 (lines {st_start + 1}-{st_end + 1})")
 
           lines[st_start] = "#if 1\n"
+          lines[st_end] = "#endif\n"
           block = "".join(lines[st_start + 1 : st_end])
 
           # Driver choice

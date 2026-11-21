@@ -1,0 +1,394 @@
+name: Build ComponentTester 1.57m (AY-AT 8MHz)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lcd_driver:
+        description: "Display controller (try LCD_SEMI_ST7735 if display is garbled)"
+        type: choice
+        default: "LCD_ST7735"
+        options:
+          - "LCD_ST7735"
+          - "LCD_SEMI_ST7735"
+      lcd_flip_x:
+        description: "Horizontal flip (LCD_FLIP_X)"
+        type: boolean
+        default: true
+      lcd_flip_y:
+        description: "Vertical flip (LCD_FLIP_Y)"
+        type: boolean
+        default: false
+      lcd_bgr:
+        description: "Swap Red/Blue channels (LCD_BGR)"
+        type: boolean
+        default: false
+      lcd_offset_x:
+        description: "X dot offset (0 = disabled; try 2 or 4 if image is shifted)"
+        type: string
+        default: "0"
+      lcd_offset_y:
+        description: "Y dot offset (0 = disabled; try 1 or 2 if image is shifted)"
+        type: string
+        default: "0"
+      symbols:
+        description: "Component icon size (24x24 leaves more flash for extra features)"
+        type: choice
+        default: "SYMBOLS_24X24_HF"
+        options:
+          - "SYMBOLS_24X24_HF"
+          - "SYMBOLS_30X32_HF"
+      hw_ref25:
+        description: "Enable 2.5V reference (HW_REF25 - enable only if using precision ref or tested TL431)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install AVR toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-avr avr-libc binutils-avr make
+
+      - name: Fetch and extract ComponentTester 1.57m
+        run: |
+          git clone --depth 1 https://github.com/kubi48/TransistorTester-source.git repo
+          TARBALL=$(ls repo/Markus/*1.57m*.t*gz | head -n 1)
+          echo "Using archive: $TARBALL"
+          test -n "$TARBALL"
+          mkdir -p extract
+          tar -xzf "$TARBALL" -C extract
+
+      - name: Configure for AY-AT (8 MHz, ST7735) and auto-pack features
+        env:
+          LCD_DRIVER: ${{ inputs.lcd_driver }}
+          LCD_FLIP_X: ${{ inputs.lcd_flip_x }}
+          LCD_FLIP_Y: ${{ inputs.lcd_flip_y }}
+          LCD_BGR: ${{ inputs.lcd_bgr }}
+          LCD_OFFSET_X: ${{ inputs.lcd_offset_x }}
+          LCD_OFFSET_Y: ${{ inputs.lcd_offset_y }}
+          SYMBOLS: ${{ inputs.symbols }}
+          HW_REF25: ${{ inputs.hw_ref25 }}
+        run: |
+          python3 - << 'EOF'
+          import os, re, shutil, subprocess, sys
+          from pathlib import Path
+
+          # Locate extracted source directory
+          src_dir = None
+          for p in Path("extract").rglob("config_328.h"):
+              src_dir = p.parent
+              break
+          if not src_dir:
+              sys.exit("ERROR: Could not locate config_328.h in extracted archive.")
+          print(f"Source directory: {src_dir}")
+
+          FLASH_MAX = 32768
+          EEPROM_MAX = 1024
+
+          def has_macro(text, name):
+              return re.search(rf"(?m)^\s*(?://\s*)?#define\s+{re.escape(name)}\b", text) is not None
+
+          def enable_macro(text, name):
+              return re.sub(
+                  rf"(?m)^(\s*)//\s*(#define\s+{re.escape(name)}\b)",
+                  r"\1\2",
+                  text,
+              )
+
+          def disable_macro(text, name):
+              return re.sub(
+                  rf"(?m)^(\s*)(#define\s+{re.escape(name)}\b)",
+                  r"\1//\2",
+                  text,
+              )
+
+          def set_macro_val(text, name, val):
+              return re.sub(
+                  rf"(?m)^(\s*)(?://\s*)?(#define\s+{re.escape(name)}\s+)\S+",
+                  rf"\1\g<2>{val}",
+                  text,
+              )
+
+          def build_and_measure():
+              subprocess.run(
+                  ["make", "clean"],
+                  cwd=src_dir,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              res = subprocess.run(
+                  ["make", f"-j{os.cpu_count() or 2}"],
+                  cwd=src_dir,
+                  capture_output=True,
+                  text=True,
+              )
+              if res.returncode != 0:
+                  return False, 0, 0, 0, res.stderr
+              out = subprocess.check_output(
+                  ["avr-size", "-A", "ComponentTester.elf"],
+                  cwd=src_dir,
+                  text=True,
+              )
+              secs = {}
+              for line in out.splitlines():
+                  parts = line.split()
+                  if len(parts) >= 2 and parts[0].startswith("."):
+                      try:
+                          secs[parts[0]] = int(parts[1])
+                      except ValueError:
+                          pass
+              flash = secs.get(".text", 0) + secs.get(".data", 0)
+              ram = secs.get(".data", 0) + secs.get(".bss", 0)
+              eeprom = secs.get(".eeprom", 0)
+              ok = (flash <= FLASH_MAX) and (eeprom <= EEPROM_MAX)
+              return ok, flash, ram, eeprom, res.stderr
+
+          # 1. Patch Makefile (ATmega328P @ 8 MHz)
+          mk_path = src_dir / "Makefile"
+          mk = mk_path.read_text()
+          mk = re.sub(r"(?m)^MCU\s*=.*", "MCU = atmega328", mk)
+          mk = re.sub(r"(?m)^FREQ\s*=.*", "FREQ = 8", mk)
+          mk_path.write_text(mk)
+
+          # 2. Patch config_328.h (Disable HD44780, Enable AY-AT ST7735, Set Encoder pins)
+          c328_path = src_dir / "config_328.h"
+          lines = c328_path.read_text().splitlines(keepends=True)
+
+          # Disable default HD44780 block
+          for i, ln in enumerate(lines):
+              if re.match(r"^\s*#define\s+LCD_HD44780\b", ln):
+                  for j in range(i - 1, max(-1, i - 10), -1):
+                      if re.match(r"^\s*(?://\s*)?#if\s+[01]\b", lines[j]):
+                          lines[j] = "#if 0\n"
+                          break
+                  for j in range(i + 1, len(lines)):
+                      if re.match(r"^\s*(?://\s*)?#endif\b", lines[j]):
+                          lines[j] = "#endif\n"
+                          break
+                  break
+
+          # Locate and configure ST7735 block
+          st_start = st_end = None
+          for i, ln in enumerate(lines):
+              if re.match(r"^\s*(?://\s*)?#define\s+LCD_ST7735\b", ln):
+                  for j in range(i - 1, max(-1, i - 10), -1):
+                      if re.match(r"^\s*(?://\s*)?#if\s+[01]\b", lines[j]):
+                          st_start = j
+                          break
+                  for j in range(i + 1, len(lines)):
+                      if re.match(r"^\s*(?://\s*)?#endif\b", lines[j]):
+                          st_end = j
+                          break
+                  break
+
+          if st_start is None or st_end is None:
+              sys.exit("ERROR: Could not locate ST7735 block in config_328.h")
+
+          lines[st_start] = "#if 1\n"
+          lines[st_end] = "#endif\n"
+          block = "".join(lines[st_start + 1 : st_end])
+
+          # Driver choice
+          if os.environ["LCD_DRIVER"] == "LCD_SEMI_ST7735":
+              block = disable_macro(block, "LCD_ST7735")
+              block = enable_macro(block, "LCD_SEMI_ST7735")
+          else:
+              block = enable_macro(block, "LCD_ST7735")
+              block = disable_macro(block, "LCD_SEMI_ST7735")
+
+          # AY-AT PORTD bit-bang SPI pinout
+          for macro, val in [
+              ("LCD_PORT", "PORTD"),
+              ("LCD_DDR", "DDRD"),
+              ("LCD_RES", "PD0"),
+              ("LCD_CS", "PD5"),
+              ("LCD_DC", "PD1"),
+              ("LCD_SCL", "PD2"),
+              ("LCD_SDA", "PD3"),
+              ("LCD_DOTS_X", "128"),
+              ("LCD_DOTS_Y", "160"),
+          ]:
+              block = set_macro_val(block, macro, val)
+
+          block = enable_macro(block, "LCD_ROTATE")
+          block = enable_macro(block, "LCD_LATE_ON")
+          block = enable_macro(block, "SPI_BITBANG")
+          block = disable_macro(block, "SPI_HARDWARE")
+
+          for flag, env_key in [
+              ("LCD_FLIP_X", "LCD_FLIP_X"),
+              ("LCD_FLIP_Y", "LCD_FLIP_Y"),
+              ("LCD_BGR", "LCD_BGR"),
+          ]:
+              block = enable_macro(block, flag) if os.environ[env_key] == "true" else disable_macro(block, flag)
+
+          for off_macro, env_key in [("LCD_OFFSET_X", "LCD_OFFSET_X"), ("LCD_OFFSET_Y", "LCD_OFFSET_Y")]:
+              val = int(os.environ[env_key] or "0")
+              block = set_macro_val(block, off_macro, str(val)) if val > 0 else disable_macro(block, off_macro)
+
+          # Select font & symbol set
+          block = re.sub(r"(?m)^(\s*)(#define\s+FONT_\w+)", r"\1//\2", block)
+          block = enable_macro(block, "FONT_10X16_HF")
+          block = re.sub(r"(?m)^(\s*)(#define\s+SYMBOLS_\w+)", r"\1//\2", block)
+          block = enable_macro(block, os.environ["SYMBOLS"])
+
+          c328_text = "".join(lines[: st_start + 1]) + block + "".join(lines[st_end:])
+          c328_text = set_macro_val(c328_text, "ENCODER_A", "PD1")
+          c328_text = set_macro_val(c328_text, "ENCODER_B", "PD3")
+          c328_path.write_text(c328_text)
+
+          # 3. Patch config.h — AY-AT hardware baseline
+          cfg_path = src_dir / "config.h"
+          cfg = cfg_path.read_text()
+
+          base_enable = [
+              "HW_ENCODER",
+              "HW_FREQ_COUNTER_BASIC",
+              "HW_ZENER",
+              "ZENER_UNSWITCHED",
+              "UI_AUTOHOLD",
+              "POWER_OFF_TIMEOUT",
+              "SW_POWER_OFF",
+              "UI_COLORED_TITLES",
+              "UI_COLORED_CURSOR",
+              "UI_PROBE_COLORS",
+              "UI_MENU_PAGEMODE",
+          ]
+          for m in base_enable:
+              cfg = enable_macro(cfg, m)
+
+          cfg = set_macro_val(cfg, "ENCODER_PULSES", "4")
+          cfg = set_macro_val(cfg, "ENCODER_STEPS", "20")
+
+          if os.environ["HW_REF25"] == "true":
+              cfg = enable_macro(cfg, "HW_REF25")
+          else:
+              cfg = disable_macro(cfg, "HW_REF25")
+
+          # Disable large/conflicting defaults before greedy packing
+          for m in ["SW_IR_RECEIVER", "SW_PWM_SIMPLE", "SW_CONTRAST"]:
+              cfg = disable_macro(cfg, m)
+
+          cfg_path.write_text(cfg)
+          ok, flash, ram, eeprom, err = build_and_measure()
+          if not ok:
+              print(err)
+              sys.exit(f"ERROR: Baseline build failed (flash={flash}, eeprom={eeprom}).")
+          print(f"Baseline OK: flash={flash}/{FLASH_MAX}, ram={ram}, eeprom={eeprom}/{EEPROM_MAX}")
+
+          # 4. Greedy feature packer (stock AY-AT compatible tools, priority order)
+          candidates = [
+              "SW_PWM_PLUS",
+              "SW_SQUAREWAVE",
+              "SW_ESR_TOOL",
+              "SW_CAP_LEAKAGE",
+              "SW_MONITOR_RCL",
+              "SW_C_VLOSS",
+              "SW_REVERSE_HFE",
+              "SW_OPTO_COUPLER",
+              "SW_UJT",
+              "SW_ENCODER",
+              "SW_PHOTODIODE",
+              "SW_SCHOTTKY_BJT",
+              "SW_R_E24_5",
+              "UI_BATTERY",
+              "SW_IR_RECEIVER",
+              "SW_MONITOR_R",
+              "SW_MONITOR_C",
+              "SW_MONITOR_L",
+          ]
+
+          good_cfg = cfg
+          added, already_on, skipped = [], [], []
+
+          for feat in candidates:
+              if not has_macro(good_cfg, feat):
+                  skipped.append((feat, "not present in 1.57m config.h"))
+                  continue
+              if re.search(rf"(?m)^\s*#define\s+{re.escape(feat)}\b", good_cfg):
+                  already_on.append(feat)
+                  continue
+
+              trial = enable_macro(good_cfg, feat)
+              cfg_path.write_text(trial)
+              ok, f_new, r_new, e_new, _ = build_and_measure()
+              if ok:
+                  good_cfg = trial
+                  flash, ram, eeprom = f_new, r_new, e_new
+                  added.append((feat, f_new))
+                  print(f" + {feat} fits (flash={f_new}/{FLASH_MAX}, eeprom={e_new}/{EEPROM_MAX})")
+              else:
+                  skipped.append((feat, "exceeds 32KB flash or incompatible"))
+                  print(f" - {feat} skipped (overflow/incompatible)")
+                  # Fallback to SW_PWM_SIMPLE if SW_PWM_PLUS didn't fit
+                  if feat == "SW_PWM_PLUS" and has_macro(good_cfg, "SW_PWM_SIMPLE"):
+                      trial_fb = enable_macro(good_cfg, "SW_PWM_SIMPLE")
+                      cfg_path.write_text(trial_fb)
+                      ok_fb, f_fb, r_fb, e_fb, _ = build_and_measure()
+                      if ok_fb:
+                          good_cfg = trial_fb
+                          flash, ram, eeprom = f_fb, r_fb, e_fb
+                          added.append(("SW_PWM_SIMPLE (fallback)", f_fb))
+                          print(f" + SW_PWM_SIMPLE fallback fits (flash={f_fb}/{FLASH_MAX})")
+
+          # Final clean build with winning config
+          cfg_path.write_text(good_cfg)
+          ok, flash, ram, eeprom, err = build_and_measure()
+          if not ok:
+              print(err)
+              sys.exit("ERROR: Final build unexpectedly failed.")
+
+          # Prepare artifact directory & summary
+          out_dir = Path("out")
+          out_dir.mkdir(exist_ok=True)
+          for fname in [
+              "ComponentTester.hex",
+              "ComponentTester.eep",
+              "config.h",
+              "config_328.h",
+              "Makefile",
+              "Clones",
+          ]:
+              fpath = src_dir / fname
+              if fpath.exists():
+                  shutil.copy2(fpath, out_dir / fname)
+
+          summary = [
+              "# ComponentTester 1.57m Build Summary (AY-AT / 8 MHz / ST7735)",
+              "",
+              f"- **Flash:** `{flash} / {FLASH_MAX} bytes` ({flash * 100 / FLASH_MAX:.1f}%)",
+              f"- **RAM:** `{ram} / 2048 bytes` ({ram * 100 / 2048:.1f}%)",
+              f"- **EEPROM:** `{eeprom} / {EEPROM_MAX} bytes` ({eeprom * 100 / EEPROM_MAX:.1f}%)",
+              f"- **Display:** `{os.environ['LCD_DRIVER']}`, `FONT_10X16_HF`, `{os.environ['SYMBOLS']}`",
+              "",
+              "## Core AY-AT Features Enabled",
+              ", ".join(f"`{m}`" for m in base_enable),
+              "",
+              "## Extra Features Packed In",
+              "\n".join(f"- `{m}` (total flash: {sz} B)" for m, sz in added) or "- (none)",
+              "",
+              "## Already Enabled by Default",
+              ", ".join(f"`{m}`" for m in already_on) or "(none)",
+              "",
+              "## Skipped (Flash Limit / Unavailable)",
+              "\n".join(f"- `{m}` — {reason}" for m, reason in skipped) or "- (none)",
+              "",
+              "## Recommended Fuses (ATmega328P, 8 MHz Crystal)",
+              "- `lfuse`: `0xF7` | `hfuse`: `0xD9` | `efuse`: `0xFC` (or `0x04` on older avrdude)",
+          ]
+          summary_text = "\n".join(summary) + "\n"
+          (out_dir / "build_summary.txt").write_text(summary_text)
+          if "GITHUB_STEP_SUMMARY" in os.environ:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+                  fh.write(summary_text)
+          print(summary_text)
+          EOF
+
+      - name: Upload firmware artifact (.hex, .eep, configs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComponentTester-1.57m-AY-AT-8MHz
+          path: out/

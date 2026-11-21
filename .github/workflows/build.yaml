@@ -76,6 +76,8 @@ jobs:
           import os, re, shutil, subprocess, sys
           from pathlib import Path
 
+          ENC = "latin-1"
+
           # Locate extracted source directory
           src_dir = None
           for p in Path("extract").rglob("config_328.h"):
@@ -107,8 +109,8 @@ jobs:
 
           def set_macro_val(text, name, val):
               return re.sub(
-                  rf"(?m)^(\s*)(?://\s*)?(#define\s+{re.escape(name)}\s+)\S+",
-                  rf"\1\g<2>{val}",
+                  rf"(?m)^(\s*)(?://\s*)?(#define\s+{re.escape(name)})(?:\s+(?!/\*)\S+)?",
+                  rf"\1\2 {val}",
                   text,
               )
 
@@ -148,14 +150,14 @@ jobs:
 
           # 1. Patch Makefile (ATmega328P @ 8 MHz)
           mk_path = src_dir / "Makefile"
-          mk = mk_path.read_text()
+          mk = mk_path.read_text(encoding=ENC)
           mk = re.sub(r"(?m)^MCU\s*=.*", "MCU = atmega328", mk)
           mk = re.sub(r"(?m)^FREQ\s*=.*", "FREQ = 8", mk)
-          mk_path.write_text(mk)
+          mk_path.write_text(mk, encoding=ENC)
 
           # 2. Patch config_328.h (Disable HD44780, Enable AY-AT ST7735, Set Encoder pins)
           c328_path = src_dir / "config_328.h"
-          lines = c328_path.read_text().splitlines(keepends=True)
+          lines = c328_path.read_text(encoding=ENC).splitlines(keepends=True)
 
           # Disable default HD44780 block
           for i, ln in enumerate(lines):
@@ -193,8 +195,15 @@ jobs:
 
           # Driver choice
           if os.environ["LCD_DRIVER"] == "LCD_SEMI_ST7735":
-              block = disable_macro(block, "LCD_ST7735")
-              block = enable_macro(block, "LCD_SEMI_ST7735")
+              if has_macro(block, "LCD_SEMI_ST7735"):
+                  block = disable_macro(block, "LCD_ST7735")
+                  block = enable_macro(block, "LCD_SEMI_ST7735")
+              else:
+                  block = re.sub(
+                      r"(?m)^(\s*)(?://\s*)?#define\s+LCD_ST7735\b",
+                      r"\1#define LCD_SEMI_ST7735",
+                      block,
+                  )
           else:
               block = enable_macro(block, "LCD_ST7735")
               block = disable_macro(block, "LCD_SEMI_ST7735")
@@ -238,11 +247,11 @@ jobs:
           c328_text = "".join(lines[: st_start + 1]) + block + "".join(lines[st_end:])
           c328_text = set_macro_val(c328_text, "ENCODER_A", "PD1")
           c328_text = set_macro_val(c328_text, "ENCODER_B", "PD3")
-          c328_path.write_text(c328_text)
+          c328_path.write_text(c328_text, encoding=ENC)
 
           # 3. Patch config.h — AY-AT hardware baseline
           cfg_path = src_dir / "config.h"
-          cfg = cfg_path.read_text()
+          cfg = cfg_path.read_text(encoding=ENC)
 
           base_enable = [
               "HW_ENCODER",
@@ -272,7 +281,7 @@ jobs:
           for m in ["SW_IR_RECEIVER", "SW_PWM_SIMPLE", "SW_CONTRAST"]:
               cfg = disable_macro(cfg, m)
 
-          cfg_path.write_text(cfg)
+          cfg_path.write_text(cfg, encoding=ENC)
           ok, flash, ram, eeprom, err = build_and_measure()
           if not ok:
               print(err)
@@ -313,29 +322,28 @@ jobs:
                   continue
 
               trial = enable_macro(good_cfg, feat)
-              cfg_path.write_text(trial)
+              cfg_path.write_text(trial, encoding=ENC)
               ok, f_new, r_new, e_new, _ = build_and_measure()
               if ok:
                   good_cfg = trial
                   flash, ram, eeprom = f_new, r_new, e_new
                   added.append((feat, f_new))
-                  print(f" + {feat} fits (flash={f_new}/{FLASH_MAX}, eeprom={e_new}/{EEPROM_MAX})")
+                  print(f"  + {feat} fits (flash={f_new}/{FLASH_MAX}, eeprom={e_new}/{EEPROM_MAX})")
               else:
                   skipped.append((feat, "exceeds 32KB flash or incompatible"))
-                  print(f" - {feat} skipped (overflow/incompatible)")
-                  # Fallback to SW_PWM_SIMPLE if SW_PWM_PLUS didn't fit
+                  print(f"  - {feat} skipped (overflow/incompatible)")
                   if feat == "SW_PWM_PLUS" and has_macro(good_cfg, "SW_PWM_SIMPLE"):
                       trial_fb = enable_macro(good_cfg, "SW_PWM_SIMPLE")
-                      cfg_path.write_text(trial_fb)
+                      cfg_path.write_text(trial_fb, encoding=ENC)
                       ok_fb, f_fb, r_fb, e_fb, _ = build_and_measure()
                       if ok_fb:
                           good_cfg = trial_fb
                           flash, ram, eeprom = f_fb, r_fb, e_fb
                           added.append(("SW_PWM_SIMPLE (fallback)", f_fb))
-                          print(f" + SW_PWM_SIMPLE fallback fits (flash={f_fb}/{FLASH_MAX})")
+                          print(f"  + SW_PWM_SIMPLE fallback fits (flash={f_fb}/{FLASH_MAX})")
 
           # Final clean build with winning config
-          cfg_path.write_text(good_cfg)
+          cfg_path.write_text(good_cfg, encoding=ENC)
           ok, flash, ram, eeprom, err = build_and_measure()
           if not ok:
               print(err)
@@ -380,9 +388,9 @@ jobs:
               "- `lfuse`: `0xF7` | `hfuse`: `0xD9` | `efuse`: `0xFC` (or `0x04` on older avrdude)",
           ]
           summary_text = "\n".join(summary) + "\n"
-          (out_dir / "build_summary.txt").write_text(summary_text)
+          (out_dir / "build_summary.txt").write_text(summary_text, encoding="utf-8")
           if "GITHUB_STEP_SUMMARY" in os.environ:
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
                   fh.write(summary_text)
           print(summary_text)
           EOF

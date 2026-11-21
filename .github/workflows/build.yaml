@@ -115,6 +115,14 @@ jobs:
                   count=1,
               )
 
+          def parse_avr_size_total(fpath):
+              out = subprocess.check_output(["avr-size", "-A", str(fpath)], text=True)
+              for line in out.splitlines():
+                  parts = line.split()
+                  if len(parts) >= 2 and parts[0].lower() == "total":
+                      return int(parts[1])
+              return 0
+
           def build_and_measure():
               subprocess.run(
                   ["make", "clean"],
@@ -130,23 +138,35 @@ jobs:
               )
               if res.returncode != 0:
                   return False, 0, 0, 0, (res.stdout + "\n" + res.stderr)
-              out = subprocess.check_output(
-                  ["avr-size", "-A", "ComponentTester.elf"],
-                  cwd=src_dir,
-                  text=True,
-              )
-              secs = {}
-              for line in out.splitlines():
-                  parts = line.split()
-                  if len(parts) >= 2 and parts[0].startswith("."):
-                      try:
-                          secs[parts[0]] = int(parts[1])
-                      except ValueError:
-                          pass
-              flash = secs.get(".text", 0) + secs.get(".data", 0)
-              ram = secs.get(".data", 0) + secs.get(".bss", 0)
-              eeprom = secs.get(".eeprom", 0)
-              ok = (flash <= FLASH_MAX) and (eeprom <= EEPROM_MAX)
+
+              elf_files = sorted(src_dir.rglob("*.elf"))
+              if elf_files:
+                  out = subprocess.check_output(
+                      ["avr-size", "-A", str(elf_files[0])],
+                      text=True,
+                  )
+                  secs = {}
+                  for line in out.splitlines():
+                      parts = line.split()
+                      if len(parts) >= 2 and parts[0].startswith("."):
+                          try:
+                              secs[parts[0]] = int(parts[1])
+                          except ValueError:
+                              pass
+                  flash = secs.get(".text", 0) + secs.get(".data", 0)
+                  ram = secs.get(".data", 0) + secs.get(".bss", 0)
+                  eeprom = secs.get(".eeprom", 0)
+              else:
+                  hex_files = sorted(src_dir.rglob("*.hex"))
+                  eep_files = sorted(src_dir.rglob("*.eep"))
+                  if not hex_files:
+                      listing = ", ".join(sorted(p.name for p in src_dir.iterdir()))
+                      return False, 0, 0, 0, f"No .elf or .hex produced.\nFiles: {listing}\n{res.stdout}\n{res.stderr}"
+                  flash = parse_avr_size_total(hex_files[0])
+                  ram = 0
+                  eeprom = parse_avr_size_total(eep_files[0]) if eep_files else 0
+
+              ok = (flash > 0) and (flash <= FLASH_MAX) and (eeprom <= EEPROM_MAX)
               return ok, flash, ram, eeprom, res.stderr
 
           # 1. Patch Makefile (ATmega328P @ 8 MHz)
@@ -366,14 +386,13 @@ jobs:
           # Prepare artifact directory & summary
           out_dir = Path("out")
           out_dir.mkdir(exist_ok=True)
-          for fname in [
-              "ComponentTester.hex",
-              "ComponentTester.eep",
-              "config.h",
-              "config_328.h",
-              "Makefile",
-              "Clones",
-          ]:
+          binaries = []
+          for pattern in ("*.hex", "*.eep"):
+              for fpath in sorted(src_dir.rglob(pattern)):
+                  shutil.copy2(fpath, out_dir / fpath.name)
+                  binaries.append(fpath.name)
+
+          for fname in ["config.h", "config_328.h", "Makefile", "Clones"]:
               fpath = src_dir / fname
               if fpath.exists():
                   shutil.copy2(fpath, out_dir / fname)
@@ -381,6 +400,7 @@ jobs:
           summary = [
               "# ComponentTester 1.57m Build Summary (AY-AT / 8 MHz / ST7735)",
               "",
+              f"- **Binaries:** {', '.join(f'`{b}`' for b in binaries) or '(none)'}",
               f"- **Flash:** `{flash} / {FLASH_MAX} bytes` ({flash * 100 / FLASH_MAX:.1f}%)",
               f"- **RAM:** `{ram} / 2048 bytes` ({ram * 100 / 2048:.1f}%)",
               f"- **EEPROM:** `{eeprom} / {EEPROM_MAX} bytes` ({eeprom * 100 / EEPROM_MAX:.1f}%)",
